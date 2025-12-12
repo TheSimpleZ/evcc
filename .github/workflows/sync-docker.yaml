@@ -3,6 +3,8 @@ on:
   schedule:
     - cron: '0 * * * *' # Check every hour
   workflow_dispatch:      # Allow manual run
+  push:
+    branches: ['custom'] # Trigger when you push your changes
 
 env:
   # Replace with your Docker image name (usually ghcr.io/username/repo-name)
@@ -12,8 +14,8 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # To push the new git tag
-      packages: write       # To push to GHCR
+      contents: write
+      packages: write
     steps:
       - name: Checkout your fork
         uses: actions/checkout@v4
@@ -23,65 +25,105 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config user.name "Docker Auto-Builder"
+          git config user.name "Auto-Builder"
           git config user.email "actions@github.com"
-          git remote add upstream https://github.com/evcc-io/evcc.git
-          git fetch upstream --tags
-
-      - name: Determine Version and Rebase
-        id: prep
-        run: |
-          # 1. Fetch all tags to ensure we have them locally
+          git remote add upstream https://github.com/original-owner/original-repo.git
           git fetch upstream --tags --force
 
-          # 2. Find latest upstream tag (clean version)
-          LATEST_UPSTREAM=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null || echo "none")
+      - name: Calculate Next Version
+        id: calc
+        run: |
+          # 1. Get latest upstream tag (clean)
+          UPSTREAM_VER=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null || echo "none")
 
-          if [ "$LATEST_UPSTREAM" == "none" ]; then
-            echo "No upstream tags found."
+          if [ "$UPSTREAM_VER" == "none" ]; then
+            echo "No upstream tags found. Exiting."
             exit 0
           fi
 
-          # 3. Define your custom tag
-          MY_TAG="${LATEST_UPSTREAM}-custom"
+          # 2. Find the highest existing custom version for this upstream release
+          # We look for tags like: v1.0.0-custom-v1, v1.0.0-custom-v2
+          PREFIX="${UPSTREAM_VER}-custom-v"
 
-          if git rev-parse "$MY_TAG" >/dev/null 2>&1; then
-            echo "Tag $MY_TAG already exists. Skipping build."
-            echo "build_needed=false" >> $GITHUB_OUTPUT
-            exit 0
+          # List tags, filter by prefix, sort by version number, take the last one
+          LAST_CUSTOM_TAG=$(git tag -l "${PREFIX}*" | sort -V | tail -n1)
+
+          if [ -z "$LAST_CUSTOM_TAG" ]; then
+            # First time seeing this upstream version
+            NEXT_NUM="1"
+          else
+            # Extract number after the last 'v' and increment
+            LAST_NUM=${LAST_CUSTOM_TAG##*v}
+            NEXT_NUM=$((LAST_NUM + 1))
           fi
 
-          echo "New upstream found: $LATEST_UPSTREAM. Rebasing..."
+          NEW_TAG="${PREFIX}${NEXT_NUM}"
+          FLOATING_TAG="${UPSTREAM_VER}-custom-latest"
 
-          # 4. Rebase Logic
-          git checkout custom
-          git checkout -b "build-$MY_TAG"
+          echo "Upstream: $UPSTREAM_VER"
+          echo "Next Version: $NEW_TAG"
 
-          # --- THE FIX IS HERE ---
-          # We rebase directly onto the tag name, not upstream/tagname
-          git rebase "$LATEST_UPSTREAM"
+          echo "upstream_ver=$UPSTREAM_VER" >> $GITHUB_OUTPUT
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "floating_tag=$FLOATING_TAG" >> $GITHUB_OUTPUT
+          echo "last_custom_tag=$LAST_CUSTOM_TAG" >> $GITHUB_OUTPUT
 
-          # 5. Create the Git tag
-          git tag "$MY_TAG"
-          git push origin "$MY_TAG"
+      - name: Rebase and Check Changes
+        id: build
+        run: |
+          UPSTREAM_VER="${{ steps.calc.outputs.upstream_ver }}"
+          NEW_TAG="${{ steps.calc.outputs.new_tag }}"
+          LAST_TAG="${{ steps.calc.outputs.last_custom_tag }}"
 
-          echo "build_needed=true" >> $GITHUB_OUTPUT
-          echo "docker_tag=$MY_TAG" >> $GITHUB_OUTPUT
+          # 1. Checkout your feature branch
+          git checkout my-features
 
-      - name: Log in to the Container registry
-        if: steps.prep.outputs.build_needed == 'true'
+          # 2. Create temp branch for build
+          git checkout -b "build-${NEW_TAG}"
+
+          # 3. Rebase onto upstream tag
+          git rebase "$UPSTREAM_VER"
+
+          # 4. DUPLICATE CHECK
+          # If a previous custom tag exists, compare the file contents (tree hash)
+          # If the code is identical to the last version, don't release again.
+          if [ ! -z "$LAST_TAG" ]; then
+             CURRENT_TREE=$(git rev-parse HEAD^{tree})
+             LAST_TREE=$(git rev-parse "$LAST_TAG"^{tree})
+
+             if [ "$CURRENT_TREE" == "$LAST_TREE" ]; then
+               echo "No changes detected compared to $LAST_TAG. Skipping build."
+               echo "do_build=false" >> $GITHUB_OUTPUT
+               exit 0
+             fi
+          fi
+
+          # 5. Push Tags
+          git tag "$NEW_TAG"
+          git push origin "$NEW_TAG"
+
+          # Move the floating tag (custom-latest) to this new commit
+          # --force is needed to move an existing tag
+          git tag -f "${{ steps.calc.outputs.floating_tag }}"
+          git push -f origin "${{ steps.calc.outputs.floating_tag }}"
+
+          echo "do_build=true" >> $GITHUB_OUTPUT
+
+      - name: Log in to Registry
+        if: steps.build.outputs.do_build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        if: steps.prep.outputs.build_needed == 'true'
+      - name: Build and Push Docker
+        if: steps.build.outputs.do_build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # tags: ${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.docker_tag }}
-          # Optional: also tag as 'latest' if this is the newest
-          tags: ${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.docker_tag }},${{ env.IMAGE_NAME }}:latest
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.calc.outputs.new_tag }}
+            ${{ env.IMAGE_NAME }}:${{ steps.calc.outputs.floating_tag }}
+            ${{ env.IMAGE_NAME }}:latest
