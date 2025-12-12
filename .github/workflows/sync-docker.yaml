@@ -27,7 +27,7 @@ jobs:
         run: |
           git config user.name "Auto-Builder"
           git config user.email "actions@github.com"
-          git remote add upstream https://github.com/original-owner/original-repo.git
+          git remote add upstream https://github.com/evcc-io/evcc.git
           git fetch upstream --tags --force
 
       - name: Calculate Next Version
@@ -76,7 +76,7 @@ jobs:
           LAST_TAG="${{ steps.calc.outputs.last_custom_tag }}"
 
           # 1. Checkout your feature branch
-          git checkout my-features
+          git checkout custom
 
           # 2. Create temp branch for build
           git checkout -b "build-${NEW_TAG}"
