@@ -1,0 +1,87 @@
+name: Sync Upstream to Docker
+on:
+  schedule:
+    - cron: '0 * * * *' # Check every hour
+  workflow_dispatch:      # Allow manual run
+
+env:
+  # Replace with your Docker image name (usually ghcr.io/username/repo-name)
+  IMAGE_NAME: ghcr.io/thesimplez/evcc
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # To push the new git tag
+      packages: write       # To push to GHCR
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "Docker Auto-Builder"
+          git config user.email "actions@github.com"
+          git remote add upstream https://github.com/evcc-io/evcc.git
+          git fetch upstream --tags
+
+      - name: Determine Version and Rebase
+        id: prep
+        run: |
+          # 1. Fetch all tags to ensure we have them locally
+          git fetch upstream --tags --force
+
+          # 2. Find latest upstream tag (clean version)
+          LATEST_UPSTREAM=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null || echo "none")
+
+          if [ "$LATEST_UPSTREAM" == "none" ]; then
+            echo "No upstream tags found."
+            exit 0
+          fi
+
+          # 3. Define your custom tag
+          MY_TAG="${LATEST_UPSTREAM}-custom"
+
+          if git rev-parse "$MY_TAG" >/dev/null 2>&1; then
+            echo "Tag $MY_TAG already exists. Skipping build."
+            echo "build_needed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "New upstream found: $LATEST_UPSTREAM. Rebasing..."
+
+          # 4. Rebase Logic
+          git checkout custom
+          git checkout -b "build-$MY_TAG"
+
+          # --- THE FIX IS HERE ---
+          # We rebase directly onto the tag name, not upstream/tagname
+          git rebase "$LATEST_UPSTREAM"
+
+          # 5. Create the Git tag
+          git tag "$MY_TAG"
+          git push origin "$MY_TAG"
+
+          echo "build_needed=true" >> $GITHUB_OUTPUT
+          echo "docker_tag=$MY_TAG" >> $GITHUB_OUTPUT
+
+      - name: Log in to the Container registry
+        if: steps.prep.outputs.build_needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.prep.outputs.build_needed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # tags: ${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.docker_tag }}
+          # Optional: also tag as 'latest' if this is the newest
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.prep.outputs.docker_tag }},${{ env.IMAGE_NAME }}:latest
